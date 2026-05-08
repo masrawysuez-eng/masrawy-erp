@@ -3147,7 +3147,11 @@ function hydrate(data) {
   const arrays = ['users', 'branches', 'services', 'cashSheets', 'financials', 'inventoryRequests', 'archive', 'archiveFolders', 'notes', 'targetSales', 'landline', 'deficits', 'stock', 'logs', 'notifications', 'empLedger', 'serials', 'invoices', 'empDocs', 'deposits', 'tgtCalcSaved', 'shipments'];
   arrays.forEach(k => {
     if (!data[k]) data[k] = [];
-    else if (!Array.isArray(data[k])) data[k] = Object.values(data[k]).filter(x => x !== null);
+    else if (!Array.isArray(data[k])) {
+      const converted = Object.values(data[k]).filter(x => x !== null);
+      console.warn(`hydrate: ${k} كان object — تم تحويله إلى array (${converted.length} عنصر)`);
+      data[k] = converted;
+    }
   });
   // تأكد targetDefs دايماً object في كل levels
   // تأكد salManual دايماً object
@@ -3266,6 +3270,8 @@ async function initDB() {
         if(localData?.users?.length > 0){
           GLOBAL_DATA = hydrate(localData);
           console.log('📦 initDB: بيانات من localStorage (offline mode)');
+          // أظهر مؤشر الـ offline للمستخدم
+          try{ _isOnline=false; _showOnlineStatus(); }catch(_){}
         } else {
           GLOBAL_DATA = hydrate(df());
         }
@@ -3303,6 +3309,7 @@ function S(d, retries=3) {
     }
     const minS = cur.services?.length||0;
     const minC = cur.cashSheets?.length||0;
+    const minTgt = cur.targetSales?.length||0;
     if(minS > 10 && (d.services?.length||0) < minS * 0.6) {
       console.warn('S() رُفض: services انخفضت', d.services?.length, 'vs', minS);
       toast('⚠️ رُفض الحفظ — تراجع غير طبيعي في المبيعات','err');
@@ -3311,6 +3318,12 @@ function S(d, retries=3) {
     if(minC > 5 && (d.cashSheets?.length||0) < minC * 0.6) {
       console.warn('S() رُفض: cashSheets انخفضت');
       toast('⚠️ رُفض الحفظ — تراجع غير طبيعي في الكاش','err');
+      return;
+    }
+    // فحص إضافي: targetSales لا ينخفض بأكثر من 40% فجأة
+    if(minTgt > 20 && (d.targetSales?.length||0) < minTgt * 0.6) {
+      console.warn('S() رُفض: targetSales انخفضت', d.targetSales?.length, 'vs', minTgt);
+      toast('⚠️ رُفض الحفظ — تراجع غير طبيعي في المستهدفات','err');
       return;
     }
   }
@@ -3323,13 +3336,13 @@ function S(d, retries=3) {
   localStorage.setItem(KEY, JSON.stringify(GLOBAL_DATA));
 
   // ══ طبقة ٣: إرسال للسيرفر ══
+  const _sBackoff = (n, max) => (max - n + 1) * 1500; // 1500 → 3000 → 4500 ms
   const attempt = (n) => {
     apiCall('POST', null, GLOBAL_DATA)
     .then(res => {
       if(res.status === 409) {
         res.json().then(j => {
           console.error('🚫 S() رُفض من السيرفر:', j.reason||j.error);
-          // أعد تحميل من السيرفر لمزامنة الحالة
           initDB().then(()=> toast('🔄 تم تحديث البيانات من السيرفر — أعد المحاولة','err'));
         }).catch(()=>{});
         return null;
@@ -3338,10 +3351,22 @@ function S(d, retries=3) {
     })
     .then(text => {
       if(!text) return;
-      if(!text.includes('success') && n > 1) setTimeout(()=>attempt(n-1), 1200);
-      else if(!text.includes('success')) toast('⚠️ لم يتم الحفظ على السيرفر','err');
+      if(!text.includes('success') && n > 1) setTimeout(()=>attempt(n-1), _sBackoff(n, retries));
+      else if(!text.includes('success')){
+        console.warn('S() فشل نهائياً — خطأ السيرفر');
+        toast('⚠️ فشل الحفظ على السيرفر — سيُعاد تلقائياً عند الاتصال','err');
+        // أضف للقائمة للإرسال لاحقاً
+        try{ _sendQueue.push({_fullSync:true, retries:0}); _saveQueue(); }catch(_){}
+      }
     })
-    .catch(() => { if(n > 1) setTimeout(()=>attempt(n-1), 1200); });
+    .catch(() => {
+      if(n > 1) setTimeout(()=>attempt(n-1), _sBackoff(n, retries));
+      else {
+        console.warn('S() فشل نهائياً — انقطاع الشبكة');
+        toast('⚠️ فشل الحفظ على السيرفر — سيُعاد تلقائياً عند الاتصال','err');
+        try{ _sendQueue.push({_fullSync:true, retries:0}); _saveQueue(); }catch(_){}
+      }
+    });
   };
   attempt(retries);
 }
@@ -3416,8 +3441,81 @@ function initCashForms() {
   }
 }
 
+// ══ DRAFT SAVE — حفظ مسودة نموذج الكاش تلقائياً ══
+const _CASH_DRAFT_KEY = 'masrawy_cash_draft';
+
+function _saveCashDraft(prefix){
+  try{
+    const draft={
+      shift: document.getElementById(prefix+'CashShift')?.value||'',
+      bss:   document.getElementById(prefix+'CBss')?.value||'',
+      visa:  document.getElementById(prefix+'CVisa')?.value||'',
+      denoms:{},
+      inItems:[], outItems:[], ts: Date.now()
+    };
+    document.querySelectorAll('#'+prefix+'CashCA input').forEach(el=>{
+      if(el.value && Number(el.value)>0) draft.denoms[el.id]=el.value;
+    });
+    document.querySelectorAll('#'+prefix+'CashIn .cdrow').forEach(row=>{
+      const d=row.querySelector('.cd')?.value||'';
+      const v=row.querySelector('.cv')?.value||'';
+      if(d||v) draft.inItems.push({d,v});
+    });
+    document.querySelectorAll('#'+prefix+'CashOut .cdrow').forEach(row=>{
+      const d=row.querySelector('.cd')?.value||'';
+      const v=row.querySelector('.cv')?.value||'';
+      if(d||v) draft.outItems.push({d,v});
+    });
+    localStorage.setItem(_CASH_DRAFT_KEY+'_'+prefix, JSON.stringify(draft));
+  }catch(e){}
+}
+
+function _restoreCashDraft(prefix){
+  try{
+    const raw=localStorage.getItem(_CASH_DRAFT_KEY+'_'+prefix);
+    if(!raw) return;
+    const draft=JSON.parse(raw);
+    // لا نستعيد مسودة أقدم من 12 ساعة
+    if(Date.now()-draft.ts > 12*60*60*1000){ localStorage.removeItem(_CASH_DRAFT_KEY+'_'+prefix); return; }
+    const shiftEl=document.getElementById(prefix+'CashShift');
+    if(shiftEl && draft.shift) shiftEl.value=draft.shift;
+    const bssEl=document.getElementById(prefix+'CBss');
+    if(bssEl && draft.bss){ bssEl.value=draft.bss; }
+    const visaEl=document.getElementById(prefix+'CVisa');
+    if(visaEl && draft.visa){ visaEl.value=draft.visa; }
+    Object.keys(draft.denoms||{}).forEach(id=>{
+      const el=document.getElementById(id); if(el) el.value=draft.denoms[id];
+    });
+    if(draft.bss||draft.visa||Object.keys(draft.denoms||{}).length>0)
+      toast('📋 تم استعادة مسودة الكاش المحفوظة');
+  }catch(e){}
+}
+
+function _clearCashDraft(prefix){
+  try{ localStorage.removeItem(_CASH_DRAFT_KEY+'_'+prefix); }catch(e){}
+}
+
+function _attachCashDraftListeners(){
+  const targets=[
+    {prefix:'e', ids:['eCashShift','cBss','cVisa']},
+    {prefix:'bm', ids:['bmCashShift','bmCBss','bmCVisa']}
+  ];
+  targets.forEach(({prefix, ids})=>{
+    ids.forEach(id=>{
+      const el=document.getElementById(id);
+      if(el) el.addEventListener('input',()=>_saveCashDraft(prefix));
+      if(el) el.addEventListener('change',()=>_saveCashDraft(prefix));
+    });
+    // فئات النقدية
+    const caEl=document.getElementById(prefix==='e'?'cashCA':'bmCashCA');
+    if(caEl) caEl.addEventListener('input',()=>_saveCashDraft(prefix));
+  });
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
   initCashForms();
+  // ربط حفظ المسودة تلقائياً بعد بناء النماذج
+  setTimeout(_attachCashDraftListeners, 200);
   const sv=localStorage.getItem(KEY+'_rem');
   if(sv){document.getElementById('lUser').value=sv;document.getElementById('rem').checked=true;}
 
@@ -4110,6 +4208,19 @@ document.addEventListener('visibilitychange', async()=>{
   }
 });
 
+// يكشف لو المستخدم بدأ يعبي نموذج الكاش ولم يرسله بعد
+function _hasDirtyCashForm(){
+  const fields=['cBss','cVisa','bmCBss','bmCVisa'];
+  for(const id of fields){
+    const el=document.getElementById(id);
+    if(el && el.value && Number(el.value)!==0) return true;
+  }
+  // فحص فئات النقدية
+  const denomInputs=document.querySelectorAll('#cashCA input, #bmCashCA input');
+  for(const inp of denomInputs){ if(inp.value && Number(inp.value)>0) return true; }
+  return false;
+}
+
 async function startAutoRefresh(){
   stopAutoRefresh();
   _autoRefreshTimer = setInterval(async function(){
@@ -4214,10 +4325,17 @@ async function startAutoRefresh(){
         });
       }
 
-      GLOBAL_DATA = hydrate(fresh);
-      localStorage.setItem(KEY, JSON.stringify(GLOBAL_DATA));
-      localStorage.setItem('msrwy_sv_ts', String(Date.now()));
-      console.log(`🔄 autoRefresh: v${fresh._dbVersion||0} — ${(fresh.services||[]).length} مبيعة`);
+      // ══ حماية النماذج غير المحفوظة ══
+      // لو المستخدم في منتصف تعبئة كاش — لا نمسح البيانات
+      const _cashDirty = _hasDirtyCashForm();
+      if(_cashDirty){
+        console.log('🛡️ autoRefresh: نموذج كاش قيد التعبئة — تم تخطي overwrite');
+      } else {
+        GLOBAL_DATA = hydrate(fresh);
+        localStorage.setItem(KEY, JSON.stringify(GLOBAL_DATA));
+        localStorage.setItem('msrwy_sv_ts', String(Date.now()));
+      }
+      console.log(`🔄 autoRefresh: v${fresh._dbVersion||0} — ${(fresh.services||[]).length} مبيعة${_cashDirty?' (محمي)':''}`);
 
       // ══ تحديث جرس الإشعارات + صوت لو في جديد ══
       const prevUnread=(cur?.notifications||[]).filter(n=>!n.read&&(n.to==='all'||n.to===CU.role)).length;
@@ -7322,7 +7440,9 @@ async function lbReset(cid,ovKey){
 
 function initCashF(){
   const a=document.getElementById('cashCA');if(!a)return;
-  a.innerHTML=DENOMS.map(d=>`<div class="cdrow"><div class="clb">${d}</div><input type="number" id="cd_${String(d).replace('.','_')}" class="inp" oninput="calcC()" placeholder="عدد"><div class="crb" id="cv_${String(d).replace('.','_')}">0.00</div></div>`).join('');
+  a.innerHTML=DENOMS.map(d=>`<div class="cdrow"><div class="clb">${d}</div><input type="number" id="cd_${String(d).replace('.','_')}" class="inp" oninput="calcC();_saveCashDraft('e')" placeholder="عدد"><div class="crb" id="cv_${String(d).replace('.','_')}">0.00</div></div>`).join('');
+  // استعادة المسودة إن وجدت
+  setTimeout(()=>_restoreCashDraft('e'), 100);
 }
 function addCR(t){
   const c=document.getElementById(t==='in'?'cashIn':'cashOut');
@@ -7477,7 +7597,7 @@ async function saveEmpCash(){
       const txt = await res.text();
       if(txt.includes('success') || txt.includes('already_sent')){ serverOk=true; break; }
     } catch(e){
-      if(attempt<3) await new Promise(r=>setTimeout(r,1200));
+      if(attempt<3) await new Promise(r=>setTimeout(r, attempt*1500)); // exponential: 1500 → 3000
     }
   }
 
@@ -7487,6 +7607,7 @@ async function saveEmpCash(){
 
   _hideSending();
   if(serverOk){
+    _clearCashDraft('e'); // مسح المسودة بعد الإرسال الناجح
     chkCashSent();
     refreshADots();
     log(CU.name,'ACTION',`أرسل يومية الكاش: ${newCash.result>=0?'+':''}${Number(newCash.result).toFixed(2)}`,G());
@@ -8466,7 +8587,18 @@ async function saveBr(){
   else toast('⚠️ حُفظ محلياً — تحقق من الاتصال','err');
   closeM('brM');renderBrs();initADrops();
 }
-async function delBr(id){secure(async()=>{const d=G();d.branches=d.branches.filter(b=>b.id!=id);log(CU.name,'CRITICAL','حذف فرع',d);GLOBAL_DATA=hydrate(d);localStorage.setItem(KEY,JSON.stringify(GLOBAL_DATA));await _apiPost('delete_branch',{id:String(id)});renderBrs();toast('🗑️ تم الحذف');initADrops();});}
+async function delBr(id){secure(async()=>{
+  const j=await _apiPost('delete_branch',{id:String(id)});
+  if(j.status==='ok'||j.status==='not_found'){
+    const d=G();d.branches=d.branches.filter(b=>b.id!=id);
+    log(CU.name,'CRITICAL','حذف فرع',d);
+    GLOBAL_DATA=hydrate(d);localStorage.setItem(KEY,JSON.stringify(GLOBAL_DATA));
+    renderBrs();toast('🗑️ تم الحذف');initADrops();
+  } else {
+    toast('⚠️ فشل حذف الفرع من السيرفر — لم يتم الحذف','err');
+    console.warn('delBr failed:', j);
+  }
+});}
 function renderEmps(){
   const d=G();
   document.getElementById('empsBody').innerHTML=d.branches.map(b=>{
@@ -8550,8 +8682,40 @@ function clrMEPw(){
   f.value='';f.placeholder='اكتب كلمة المرور الجديدة';f.focus();
   if(n)n.innerText='(سيتم تغيير كلمة المرور عند الحفظ)';
 }
-async function delEmp(id){secure(async()=>{const d=G();d.users=d.users.filter(u=>u.id!=id);log(CU.name,'CRITICAL','حذف موظف',d);GLOBAL_DATA=hydrate(d);localStorage.setItem(KEY,JSON.stringify(GLOBAL_DATA));await _apiPost('delete_user',{id:String(id)});renderEmps();toast('🗑️ تم');initADrops();});}
-function togMust(id){const d=G();const i=d.users.findIndex(u=>u.id==id);if(i<0)return;d.users[i].mustChange=!d.users[i].mustChange;log(CU.name,'ACTION','تعديل إجبار تغيير كلمة المرور: '+d.users[i].name,d);GLOBAL_DATA=hydrate(d);localStorage.setItem(KEY,JSON.stringify(GLOBAL_DATA));_apiPost('save_user',{id:String(id),mustChange:d.users[i].mustChange,...d.users[i]});renderEmps();toast(d.users[i].mustChange?'🔐 تم تفعيل التغيير الإجباري':'✅ تم إلغاء التغيير الإجباري');}
+async function delEmp(id){secure(async()=>{
+  const j=await _apiPost('delete_user',{id:String(id)});
+  if(j.status==='ok'||j.status==='not_found'){
+    const d=G();d.users=d.users.filter(u=>u.id!=id);
+    log(CU.name,'CRITICAL','حذف موظف',d);
+    GLOBAL_DATA=hydrate(d);localStorage.setItem(KEY,JSON.stringify(GLOBAL_DATA));
+    renderEmps();toast('🗑️ تم');initADrops();
+  } else {
+    toast('⚠️ فشل حذف الموظف من السيرفر — لم يتم الحذف','err');
+    console.warn('delEmp failed:', j);
+  }
+});}
+async function togMust(id){
+  const d=G();
+  const i=d.users.findIndex(u=>u.id==id);
+  if(i<0) return;
+  const prevVal=d.users[i].mustChange;
+  d.users[i].mustChange=!prevVal;
+  log(CU.name,'ACTION','تعديل إجبار تغيير كلمة المرور: '+d.users[i].name,d);
+  GLOBAL_DATA=hydrate(d);
+  localStorage.setItem(KEY,JSON.stringify(GLOBAL_DATA));
+  renderEmps();
+  // أرسل للسيرفر وانتظر التأكيد
+  const j=await _apiPost('save_user',{id:String(id),mustChange:d.users[i].mustChange,...d.users[i]});
+  if(j.status==='ok'){
+    toast(d.users[i].mustChange?'🔐 تم تفعيل التغيير الإجباري':'✅ تم إلغاء التغيير الإجباري');
+  } else {
+    // rollback: لو السيرفر رفض — أعد القيمة القديمة
+    const dr=G();const ir=dr.users.findIndex(u=>u.id==id);
+    if(ir>=0){dr.users[ir].mustChange=prevVal;GLOBAL_DATA=hydrate(dr);localStorage.setItem(KEY,JSON.stringify(GLOBAL_DATA));renderEmps();}
+    toast('⚠️ فشل الحفظ — لم يتم تغيير الحالة','err');
+    console.warn('togMust rollback:', j);
+  }
+}
 
 // ============ نظام السيريالات ============
 function stkTabSwitch(tab){
@@ -8609,7 +8773,7 @@ function _stkInsert(serials){
     localStorage.setItem(KEY,JSON.stringify(GLOBAL_DATA));
 
     // إرسال السيريالات للسيرفر مباشرة
-    apiCall('POST','add_serials',{serials:_newSerials}).catch(()=>{});
+    apiCall('POST','add_serials',{serials:_newSerials}).catch(e=>console.warn('add_serials failed:',e));
   }
 
   document.getElementById('stkAddPreview').innerHTML=`✅ تم إضافة ${added} سيريال${skipped?` (${skipped} مكرر تم تجاهله)`:''}`;
@@ -8744,7 +8908,7 @@ async function delSerial(id){
     S(d);
     renderStk();renderStkReport();
     toast('🗑️ تم حذف السيريال');
-    apiCall('POST','delete_serial',{id:String(id)}).catch(()=>{});
+    apiCall('POST','delete_serial',{id:String(id)}).catch(e=>console.warn('delete_serial failed:',e));
   });
 }
 function renderStkReport(){
@@ -10161,7 +10325,7 @@ function saveStkProducts(prods){
   GLOBAL_DATA=hydrate(d);
   localStorage.setItem(KEY,JSON.stringify(GLOBAL_DATA));
   // حفظ مباشر في MySQL
-  _apiPost('save_stk_products',{products:prods}).catch(()=>{});
+  _apiPost('save_stk_products',{products:prods}).catch(e=>console.warn('save_stk_products failed:',e));
 }
 
 function initStkItemSelect(){
@@ -12909,12 +13073,26 @@ async function _processQueue(){
     const job = _sendQueue[0];
     let sent = false;
 
+    // حالة خاصة: fullSync — أعد إرسال كل البيانات للسيرفر
+    if(job._fullSync){
+      for(let t=1; t<=3 && _isOnline; t++){
+        try{
+          const res = await apiCall('POST', null, GLOBAL_DATA);
+          if(res.ok){ const txt=await res.text(); if(txt.includes('success')){sent=true;break;} }
+        }catch(e){}
+        if(t<3) await new Promise(r=>setTimeout(r, t*2000));
+      }
+      if(sent){ _sendQueue.shift(); _saveQueue(); }
+      else { job.retries=(job.retries||0)+1; if(job.retries>=5){_sendQueue.shift();_saveQueue();} break; }
+      continue;
+    }
+
     for(let t=1; t<=4 && _isOnline; t++){
       try{
         const res = await apiCall('POST','merge_items',{collection:job.collection, items:[job.item], updates:job.updates});
         if(res.ok){ const j=await res.json(); if(j.status==='success'||j.status==='already_exists'){sent=true;break;} }
       }catch(e){}
-      if(t<4) await new Promise(r=>setTimeout(r, t*1200));
+      if(t<4) await new Promise(r=>setTimeout(r, t*1500));
     }
 
     if(sent){
@@ -13280,7 +13458,8 @@ function initBMDrops(){
 
 function initBMCashF(){
   const a=document.getElementById('bmCashCA'); if(!a) return;
-  a.innerHTML=DENOMS.map(d=>`<div class="cdrow"><div class="clb">${d}</div><input type="number" id="bmcd_${String(d).replace('.','_')}" class="inp" oninput="bmCalcC()" placeholder="عدد"><div class="crb" id="bmcv_${String(d).replace('.','_')}">0.00</div></div>`).join('');
+  a.innerHTML=DENOMS.map(d=>`<div class="cdrow"><div class="clb">${d}</div><input type="number" id="bmcd_${String(d).replace('.','_')}" class="inp" oninput="bmCalcC();_saveCashDraft('bm')" placeholder="عدد"><div class="crb" id="bmcv_${String(d).replace('.','_')}">0.00</div></div>`).join('');
+  setTimeout(()=>_restoreCashDraft('bm'), 100);
 }
 
 function addBMCR(t){
@@ -13415,7 +13594,7 @@ async function saveBMCash(){
       const res=await apiCall('POST','merge_cash',cashPayload);
       const txt=await res.text();
       if(txt.includes('success')||txt.includes('already_sent')){ serverOk=true; break; }
-    }catch(e){ if(attempt<3) await new Promise(r=>setTimeout(r,1200)); }
+    }catch(e){ if(attempt<3) await new Promise(r=>setTimeout(r, attempt*1500)); } // exponential: 1500 → 3000
   }
 
   if(serverOk){
@@ -13425,6 +13604,7 @@ async function saveBMCash(){
   _hideSending();
 
   if(serverOk){
+    _clearCashDraft('bm'); // مسح المسودة بعد الإرسال الناجح
     // تحديث محلي
     d.cashSheets.push(newCash);
     if(defObj) d.deficits.push(defObj);
