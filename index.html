@@ -3131,6 +3131,7 @@ function toggleDark(){
 const KEY='MasrawyV58';
 const GRP_FH_KEYS=['فيصل','السيد هاشم','سيد هاشم','هاشم'];
 const GRP_NA_KEYS=['ناصر'];
+const SERIAL_SYNC_START='2026-04-29';
 
 async function apiCall(method, action, body, extraParams){
   let url=DB_URL;
@@ -7070,42 +7071,6 @@ function printSalCal(){
   <h1>💰 كشف الرواتب</h1>
   <div class="sub">شهر: ${mon} | تاريخ الطباعة: ${new Date().toLocaleDateString('ar-EG')}</div>
   ${results}
-
-<!-- مودال تحويل السيريال بين الفروع -->
-<div id="transferSerialM" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;align-items:center;justify-content:center" onclick="if(event.target===this)closeTransferSerial()">
-  <div style="background:var(--cb);border-radius:16px;padding:24px;width:90%;max-width:420px;border:1px solid var(--border)">
-    <h3 style="color:var(--blue);margin-bottom:16px">🔀 تحويل السيريال لفرع آخر</h3>
-    <div id="transferSerialInfo" style="background:var(--hdr);border-radius:8px;padding:12px;margin-bottom:16px;font-size:.85rem"></div>
-    <div class="fg">
-      <label style="color:var(--muted)">اختر الفرع الجديد</label>
-      <select id="transferBranchSel" class="inp"></select>
-    </div>
-    <div style="display:flex;gap:10px;margin-top:16px">
-      <button class="btn bs" style="flex:1" onclick="doTransferSerial()">🔀 تحويل</button>
-      <button class="b3" style="flex:1;padding:10px;border-radius:8px;background:var(--hdr);color:var(--muted);border:1px solid var(--border)" onclick="closeTransferSerial()">إلغاء</button>
-    </div>
-  </div>
-</div>
-
-<!-- مودال تعديل مبيعة -->
-<div id="editSrvM" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;align-items:center;justify-content:center" onclick="if(event.target===this)closeEditSrv()">
-  <div style="background:var(--cb);border-radius:16px;padding:24px;width:95%;max-width:560px;border:1px solid var(--border);max-height:90vh;overflow-y:auto">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-      <h3 style="color:var(--p)">✏️ تعديل مبيعة</h3>
-      <button onclick="closeEditSrv()" style="background:none;border:none;color:var(--muted);font-size:1.4rem;cursor:pointer">✕</button>
-    </div>
-    <div style="background:var(--hdr);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:.82rem;color:var(--muted)">
-      الموظف: <strong id="editSrvEmpName" style="color:var(--text)"></strong> &nbsp;|&nbsp;
-      النوع: <strong id="editSrvType" style="color:var(--p)"></strong>
-    </div>
-    <div id="editSrvFields" style="display:grid;grid-template-columns:1fr 1fr;gap:10px"></div>
-    <div style="display:flex;gap:10px;margin-top:20px">
-      <button class="btn bs" style="flex:1" onclick="saveEditSrv()">💾 حفظ التعديل</button>
-      <button class="b3" style="flex:1;padding:10px;border-radius:8px;background:var(--hdr);color:var(--muted);border:1px solid var(--border)" onclick="closeEditSrv()">إلغاء</button>
-    </div>
-  </div>
-</div>
-
 </body></html>`);
   w.document.close();
   setTimeout(()=>w.print(),500);
@@ -13753,13 +13718,12 @@ async function stkSyncWithSales(){
   // مفيش blacklist — السيرفر هو المرجع
   deletedSerialNums=[];
 
-  // جمع كل السيريالات من المبيعات — من 29/04/2026 للأمام بس
-  const SYNC_START_DATE = '2026-04-29';
+  // جمع كل السيريالات من المبيعات — من SERIAL_SYNC_START للأمام بس
   const soldInServices={};
   services.forEach(s=>{
     if(!s.details) return;
     const srvLocalDate = s.localDate || srvDate(s) || '';
-    if(srvLocalDate < SYNC_START_DATE) return;
+    if(srvLocalDate < SERIAL_SYNC_START) return;
     const parts=s.details.split(' | ');
     const serialPart=parts.find(p=>p.startsWith('Serial: '));
     if(!serialPart) return;
@@ -14953,7 +14917,7 @@ async function saveShipment(){
   // رفع الملفات (متعددة)
   let fileUrls = [];
   const month = document.getElementById('shipMonth')?.value || '';
-  const year  = document.getElementById('shipYear')?.value  || '2026';
+  const year  = document.getElementById('shipYear')?.value  || String(new Date().getFullYear());
   const monthLabel = month ? year+'-'+month : '';
 
   if(fileInp.files.length > 0){
@@ -15032,6 +14996,8 @@ async function saveShipment(){
 }
 
 function renderShipments(){
+  const yearEl=document.getElementById('shipYear');
+  if(yearEl&&!yearEl.value){const cy=String(new Date().getFullYear());const opt=[...yearEl.options].find(o=>o.value===cy);if(opt)opt.selected=true;}
   const d = G();
   const ships = d.shipments || [];
   const search = (document.getElementById('shipSearch')?.value||'').toLowerCase();
@@ -15513,6 +15479,41 @@ async function depDayDelete(day, branchId){
       <div id="stkProdList"></div>
     </div>
   </div>
+
+<!-- مودال تحويل السيريال بين الفروع -->
+<div id="transferSerialM" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;align-items:center;justify-content:center" onclick="if(event.target===this)closeTransferSerial()">
+  <div style="background:var(--cb);border-radius:16px;padding:24px;width:90%;max-width:420px;border:1px solid var(--border)">
+    <h3 style="color:var(--blue);margin-bottom:16px">🔀 تحويل السيريال لفرع آخر</h3>
+    <div id="transferSerialInfo" style="background:var(--hdr);border-radius:8px;padding:12px;margin-bottom:16px;font-size:.85rem"></div>
+    <div class="fg">
+      <label style="color:var(--muted)">اختر الفرع الجديد</label>
+      <select id="transferBranchSel" class="inp"></select>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button class="btn bs" style="flex:1" onclick="doTransferSerial()">🔀 تحويل</button>
+      <button class="b3" style="flex:1;padding:10px;border-radius:8px;background:var(--hdr);color:var(--muted);border:1px solid var(--border)" onclick="closeTransferSerial()">إلغاء</button>
+    </div>
+  </div>
+</div>
+
+<!-- مودال تعديل مبيعة -->
+<div id="editSrvM" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;align-items:center;justify-content:center" onclick="if(event.target===this)closeEditSrv()">
+  <div style="background:var(--cb);border-radius:16px;padding:24px;width:95%;max-width:560px;border:1px solid var(--border);max-height:90vh;overflow-y:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="color:var(--p)">✏️ تعديل مبيعة</h3>
+      <button onclick="closeEditSrv()" style="background:none;border:none;color:var(--muted);font-size:1.4rem;cursor:pointer">✕</button>
+    </div>
+    <div style="background:var(--hdr);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:.82rem;color:var(--muted)">
+      الموظف: <strong id="editSrvEmpName" style="color:var(--text)"></strong> &nbsp;|&nbsp;
+      النوع: <strong id="editSrvType" style="color:var(--p)"></strong>
+    </div>
+    <div id="editSrvFields" style="display:grid;grid-template-columns:1fr 1fr;gap:10px"></div>
+    <div style="display:flex;gap:10px;margin-top:20px">
+      <button class="btn bs" style="flex:1" onclick="saveEditSrv()">💾 حفظ التعديل</button>
+      <button class="b3" style="flex:1;padding:10px;border-radius:8px;background:var(--hdr);color:var(--muted);border:1px solid var(--border)" onclick="closeEditSrv()">إلغاء</button>
+    </div>
+  </div>
+</div>
 
 <!-- نافذة الإشعارات (Modal) -->
 <div id="nPanel" style="display:none;position:fixed;z-index:99999;width:340px;max-height:420px;background:var(--cb);border-radius:14px;border:1px solid var(--border);box-shadow:0 8px 32px rgba(0,0,0,.35);overflow:hidden;flex-direction:column">
